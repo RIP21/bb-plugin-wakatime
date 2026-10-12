@@ -3,6 +3,8 @@
  *
  * The server watches thread events, turns them into heartbeats, and hands them
  * to a host worker that runs wakatime-cli on the machine holding the worktree.
+ * Alongside that, `activity/` keeps honest turn intervals locally for the
+ * dashboard; it never talks to WakaTime.
  */
 
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
@@ -11,7 +13,10 @@ import { categorySchema, hostContract, privacyModeSchema, type HeartbeatPayload 
 import type { WakatimeCategory } from "./lib/heartbeat.js";
 import { describe as describeError, isNotFound } from "./lib/errors.js";
 import { compactDuration } from "./lib/duration.js";
+import { inferWorktreePath, planThreadBackfill, throttleBackfill, type TurnSpan } from "./lib/backfill.js";
 import {
+  chunkGroups,
+  groupByHost,
   Tracker,
   type HeartbeatGroup,
   type SendOutcome,
@@ -19,8 +24,11 @@ import {
   type TrackerOptions,
 } from "./lib/tracker.js";
 import type { ThreadEventRowLike } from "./lib/activity.js";
+import { listThreadEvents } from "./lib/events.js";
+import { MIGRATIONS } from "./lib/storage.js";
+import { activityRpcContract, registerActivity } from "./activity/server.js";
 
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.2.0";
 
 /** How often the tracker reads new thread events. */
 const POLL_INTERVAL_MS = 30_000;
@@ -38,6 +46,10 @@ const TODAY_CHANNEL = "today";
 /** Rows kept in the local activity log. */
 const LOG_RETENTION_DAYS = 14;
 const RECENT_LOG_LIMIT = 200;
+/** Pause between backfill sends, on top of wakatime-cli's own pacing. */
+const BACKFILL_SEND_PAUSE_MS = 3_000;
+/** Threads per `threads.list` page when scanning for active ones. */
+const THREAD_PAGE_SIZE = 100;
 
 const cliStatusOutput = z.object({
   path: z.string().nullable(),
@@ -58,6 +70,7 @@ const hostStatusOutput = z.object({
 });
 
 export const rpcContract = defineRpcContract({
+  ...activityRpcContract,
   status: {
     input: z.object({ includeToday: z.boolean().default(false) }).strict(),
     output: z
@@ -212,23 +225,8 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   const db = bb.storage.database();
-  bb.storage.migrate(db, [
-    `CREATE TABLE IF NOT EXISTS activity (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       sent_at INTEGER NOT NULL,
-       host_id TEXT NOT NULL,
-       thread_id TEXT NOT NULL,
-       entity TEXT NOT NULL,
-       category TEXT NOT NULL,
-       is_write INTEGER NOT NULL,
-       line_changes INTEGER,
-       ok INTEGER NOT NULL,
-       error TEXT
-     )`,
-    `CREATE INDEX IF NOT EXISTS activity_sent_at ON activity (sent_at DESC)`,
-    // Appended, never edited: migration ids are statement indexes.
-    `ALTER TABLE activity ADD COLUMN project TEXT`,
-  ]);
+  bb.storage.migrate(db, MIGRATIONS);
+  const activity = registerActivity(bb);
 
   const insertActivity = db.prepare(
     `INSERT INTO activity (sent_at, host_id, thread_id, entity, category, is_write, line_changes, ok, error, project)
@@ -309,10 +307,10 @@ export default async function plugin(bb: BbPluginApi) {
     log: (level, message) => bb.log[level](message),
 
     async listEvents({ threadId, afterSeq, limit }) {
-      const events = await bb.sdk.threads.events.list({
+      const events = await listThreadEvents(bb.sdk.threads.events.list, {
         threadId,
         order: "asc",
-        limit: String(limit),
+        limit,
         types: ["item/completed"],
         ...(afterSeq !== null ? { afterSeq: String(afterSeq) } : {}),
       });
@@ -320,20 +318,27 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     async recentEvents({ threadId, limit }) {
-      const events = await bb.sdk.threads.events.list({
+      const events = await listThreadEvents(bb.sdk.threads.events.list, {
         threadId,
         order: "desc",
-        limit: String(limit),
+        limit,
         types: ["item/completed"],
       });
       return events as unknown as ThreadEventRowLike[];
     },
 
     async listActiveThreadIds() {
-      // threads.list has no status filter, so the newest page is scanned. The
+      // threads.list has no status filter and no newest-first order, so every
+      // page is read; one fixed page missed active threads past its end. The
       // lifecycle events cover the normal path; this only repairs missed ones.
-      const threads = await bb.sdk.threads.list({ limit: 200, includeHidden: true });
-      return threads.filter((thread) => thread.status === "active").map((thread) => thread.id);
+      const ids: string[] = [];
+      for (let offset = 0; ; offset += THREAD_PAGE_SIZE) {
+        const threads = await bb.sdk.threads.list({ limit: THREAD_PAGE_SIZE, offset, includeHidden: true });
+        for (const thread of threads) {
+          if (thread.status === "active" && !thread.archivedAt) ids.push(thread.id);
+        }
+        if (threads.length < THREAD_PAGE_SIZE) return ids;
+      }
     },
 
     async getThread(threadId) {
@@ -456,6 +461,183 @@ export default async function plugin(bb: BbPluginApi) {
   bb.events.on("thread.active", ({ thread }) => {
     tracker.markActive(thread.id);
   });
+
+  /**
+   * Re-sends a window of past activity, for when reporting was down. It runs
+   * in the background because reading every thread's events takes minutes,
+   * and `bb wakatime backfill-wakatime --status` reports on it.
+   *
+   * Rate limits: WakaTime allows under 10 requests a second averaged over 5
+   * minutes. Each send here is one wakatime-cli run, which posts at most 10
+   * heartbeats and queues the rest offline; the CLI then drains that queue
+   * at most 1,000 heartbeats (100 requests) per 2 minutes. Sends are spaced
+   * on top of that, so a backfill cannot approach the limit.
+   */
+  interface BackfillJob {
+    from: number;
+    to: number;
+    dryRun: boolean;
+    state: "running" | "done" | "failed";
+    startedAt: number;
+    finishedAt: number | null;
+    threadsTotal: number;
+    threadsRead: number;
+    threadsSkipped: number;
+    planned: number;
+    sent: number;
+    failed: number;
+    perDay: Record<string, number>;
+    error: string | null;
+  }
+  let backfillJob: BackfillJob | null = null;
+  const backfillAbort = new AbortController();
+  bb.onDispose(() => backfillAbort.abort());
+
+  async function allThreadIds(): Promise<string[]> {
+    const ids = new Set<string>();
+    for (const archived of [false, true]) {
+      for (let offset = 0; ; offset += THREAD_PAGE_SIZE) {
+        const page = await bb.sdk.threads.list({ limit: THREAD_PAGE_SIZE, offset, archived, includeHidden: true });
+        for (const thread of page) if (!thread.deletedAt) ids.add(thread.id);
+        if (page.length < THREAD_PAGE_SIZE) break;
+      }
+    }
+    return [...ids];
+  }
+
+  /** Every completed item event of a thread up to `to`, oldest first. */
+  async function completedItemsBefore(threadId: string, to: number): Promise<ThreadEventRowLike[]> {
+    const rows: ThreadEventRowLike[] = [];
+    let afterSeq: string | undefined;
+    for (;;) {
+      const page = (await listThreadEvents(bb.sdk.threads.events.list, {
+        threadId,
+        order: "asc",
+        limit: 1_000,
+        types: ["item/completed"],
+        signal: backfillAbort.signal,
+        ...(afterSeq !== undefined ? { afterSeq } : {}),
+      })) as unknown as ThreadEventRowLike[];
+      rows.push(...page);
+      if (page.length < 1_000 || page[page.length - 1]!.createdAt >= to) return rows;
+      afterSeq = String(page[page.length - 1]!.seq);
+    }
+  }
+
+  async function runBackfill(job: BackfillJob): Promise<void> {
+    const options = await trackerOptions();
+    const turnRows = db
+      .prepare(
+        // Only turns that really ran to an end; the dashboard's own rules.
+        `SELECT t.thread_id, t.started_at, t.ended_at FROM turns t
+           JOIN turn_metadata m ON m.turn_row_id = t.id
+          WHERE m.accounting_version = 3 AND m.closure_reason IN ('completed', 'interaction-pending')
+            AND t.ended_at > ? AND t.started_at < ?`,
+      )
+      .all(job.from, job.to) as { thread_id: string; started_at: number; ended_at: number }[];
+    const turnsByThread = new Map<string, TurnSpan[]>();
+    for (const row of turnRows) {
+      const spans = turnsByThread.get(row.thread_id) ?? [];
+      spans.push({ start: row.started_at, end: row.ended_at });
+      turnsByThread.set(row.thread_id, spans);
+    }
+
+    // An archived thread has lost its environment. Its work can still be
+    // placed when bb has a single machine, since it can only have run there.
+    const hosts = await bb.sdk.hosts.list();
+    const soleHostId = hosts.length === 1 ? hosts[0]!.id : null;
+
+    const ids = await allThreadIds();
+    job.threadsTotal = ids.length;
+    const planned = [];
+    for (const threadId of ids) {
+      if (backfillAbort.signal.aborted) throw new Error("plugin unloaded");
+      const lookup = await deps.getThread(threadId);
+      if (lookup.kind !== "found") {
+        job.threadsSkipped += 1;
+        job.threadsRead += 1;
+        continue;
+      }
+      const environment = lookup.thread.environmentId
+        ? await deps.getEnvironment(lookup.thread.environmentId)
+        : null;
+      const rows = await completedItemsBefore(threadId, job.to);
+      const hostId = environment?.hostId ?? soleHostId;
+      const projectName = await deps.getProjectName(lookup.thread.projectId);
+      // A destroyed worktree keeps no path, and newer providers leave command
+      // `cwd` empty. The path no longer exists on disk either way, so a stand-in
+      // under the project name lands the time on the same WakaTime project.
+      const worktreePath = environment?.path ?? inferWorktreePath(rows)
+        ?? (projectName ? `/bb/${projectName}/${threadId}` : null);
+      if (!hostId || !worktreePath) {
+        job.threadsSkipped += 1;
+        job.threadsRead += 1;
+        continue;
+      }
+      const context = {
+        threadId,
+        hostId,
+        worktreePath,
+        branchName: environment?.branchName ?? null,
+        projectName,
+      };
+      planned.push(...planThreadBackfill({
+        rows,
+        turns: turnsByThread.get(threadId) ?? [],
+        context,
+        options: { ...options, keepaliveMs: HEARTBEAT_WINDOW_MS },
+        from: job.from,
+        to: job.to,
+      }));
+      job.threadsRead += 1;
+    }
+
+    const admitted = throttleBackfill(planned, HEARTBEAT_WINDOW_MS);
+    job.planned = admitted.length;
+    for (const entry of admitted) {
+      const day = new Date(entry.heartbeat.time * 1000).toISOString().slice(0, 10);
+      job.perDay[day] = (job.perDay[day] ?? 0) + 1;
+    }
+    if (job.dryRun) return;
+
+    for (const [hostId, entries] of groupByHost(admitted)) {
+      for (const batch of chunkGroups(entries)) {
+        if (backfillAbort.signal.aborted) throw new Error("plugin unloaded");
+        try {
+          const outcome = await deps.send(hostId, batch.groups);
+          job.sent += outcome.accepted;
+          job.failed += outcome.failures.reduce((sum, failure) => sum + failure.count, 0);
+        } catch (error) {
+          job.failed += batch.entries.length;
+          bb.log.warn(`backfill send of ${batch.entries.length} heartbeat(s) failed: ${describeError(error)}`);
+        }
+        await sleep(BACKFILL_SEND_PAUSE_MS, backfillAbort.signal);
+      }
+    }
+  }
+
+  function startBackfill(from: number, to: number, dryRun: boolean): BackfillJob {
+    const job: BackfillJob = {
+      from, to, dryRun, state: "running", startedAt: Date.now(), finishedAt: null,
+      threadsTotal: 0, threadsRead: 0, threadsSkipped: 0, planned: 0, sent: 0, failed: 0, perDay: {}, error: null,
+    };
+    backfillJob = job;
+    void runBackfill(job).then(
+      async () => {
+        job.state = "done";
+        job.finishedAt = Date.now();
+        bb.log.info(`backfill ${dryRun ? "dry run " : ""}done: ${job.planned} planned, ${job.sent} sent, ${job.failed} failed`);
+        if (!dryRun) await bb.storage.kv.set("backfill:last", { from, to, sent: job.sent, failed: job.failed, at: job.finishedAt });
+      },
+      (error: unknown) => {
+        job.state = "failed";
+        job.finishedAt = Date.now();
+        job.error = describeError(error);
+        try { bb.log.warn(`backfill failed: ${job.error}`) } catch { /* unloaded */ }
+      },
+    );
+    return job;
+  }
   bb.events.on("thread.idle", ({ thread }) => {
     tracker.markIdle(thread.id);
   });
@@ -691,6 +873,8 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.rpc.register(rpcContract, {
+    ...activity.handlers,
+
     async status({ includeToday }) {
       const hosts = await collectHostStatus(includeToday);
       return {
@@ -795,6 +979,12 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "sync", summary: "Flush heartbeats wakatime-cli queued offline", usage: "bb wakatime sync" },
       { name: "doctor", summary: "Diagnose setup problems (missing CLI, missing API key)", usage: "bb wakatime doctor" },
       { name: "log", summary: "Show recently reported activity", usage: "bb wakatime log [-n <count>]" },
+      ...activity.commands,
+      {
+        name: "backfill-wakatime",
+        summary: "Re-send a past window of activity to WakaTime (runs in the background)",
+        usage: "bb wakatime backfill-wakatime --from <ISO time> --to <ISO time> [--dry-run] [--force] | --status",
+      },
     ],
     async run(argv) {
       const [command = "status", ...rest] = argv;
@@ -809,10 +999,16 @@ export default async function plugin(bb: BbPluginApi) {
           return renderDoctor();
         case "log":
           return { exitCode: 0, stdout: renderLog(parseCount(rest)) };
+        case "backfill-wakatime":
+          return renderBackfill(rest);
+        case "activity":
+        case "backfill":
+        case "recheck-history":
+          return activity.run(argv);
         default:
           return {
             exitCode: 1,
-            stderr: `Unknown command '${command}'. Try status, today, sync, doctor, or log.\n`,
+            stderr: `Unknown command '${command}'. Try status, today, sync, doctor, log, activity, or backfill.\n`,
           };
       }
     },
@@ -929,6 +1125,49 @@ export default async function plugin(bb: BbPluginApi) {
     return { exitCode: problems.length > 0 ? 1 : 0, stdout: lines.join("\n") };
   }
 
+  async function renderBackfill(argv: readonly string[]): Promise<{ exitCode: number; stdout?: string; stderr?: string }> {
+    if (argv.includes("--status")) {
+      return { exitCode: 0, stdout: describeBackfill(backfillJob) };
+    }
+    const flag = (name: string) => {
+      const index = argv.indexOf(name);
+      return index >= 0 ? argv[index + 1] : undefined;
+    };
+    const from = Date.parse(flag("--from") ?? "");
+    const to = Date.parse(flag("--to") ?? "");
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) {
+      return { exitCode: 1, stderr: "Pass --from and --to as ISO times, with --to after --from.\n" };
+    }
+    if (to > Date.now()) return { exitCode: 1, stderr: "--to cannot be in the future.\n" };
+    if (backfillJob?.state === "running") {
+      return { exitCode: 1, stderr: `A backfill is already running.\n${describeBackfill(backfillJob)}` };
+    }
+    const dryRun = argv.includes("--dry-run");
+    const last = await bb.storage.kv.get<{ from: number; to: number; at: number }>("backfill:last");
+    if (!dryRun && last && from < last.to && to > last.from && !argv.includes("--force")) {
+      return {
+        exitCode: 1,
+        stderr: `This window overlaps a backfill already sent on ${new Date(last.at).toISOString()} ` +
+          `(${new Date(last.from).toISOString()} to ${new Date(last.to).toISOString()}). Pass --force to send it again.\n`,
+      };
+    }
+    const job = startBackfill(from, to, dryRun);
+    return { exitCode: 0, stdout: `Started.\n${describeBackfill(job)}Check progress with: bb wakatime backfill-wakatime --status\n` };
+  }
+
+  function describeBackfill(job: BackfillJob | null): string {
+    if (!job) return "No backfill has run since the plugin loaded.\n";
+    const lines = [
+      `${job.dryRun ? "Dry run" : "Backfill"} ${new Date(job.from).toISOString()} to ${new Date(job.to).toISOString()}: ${job.state}`,
+      `threads: ${job.threadsRead}/${job.threadsTotal} read, ${job.threadsSkipped} without a workspace`,
+      `heartbeats: ${job.planned} planned${job.dryRun ? "" : `, ${job.sent} handed to wakatime-cli, ${job.failed} failed`}`,
+    ];
+    if (job.error) lines.push(`error: ${job.error}`);
+    const days = Object.entries(job.perDay).sort(([a], [b]) => a.localeCompare(b));
+    if (days.length > 0) lines.push("per day:", ...days.map(([day, count]) => `  ${day}  ${count}`));
+    return `${lines.join("\n")}\n`;
+  }
+
   function renderLog(count: number): string {
     const rows = db
       .prepare(
@@ -947,6 +1186,7 @@ export default async function plugin(bb: BbPluginApi) {
     return `${lines.join("\n")}\n`;
   }
 
+  await activity.start();
   bb.log.info("WakaTime tracking registered");
 }
 

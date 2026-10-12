@@ -11,9 +11,14 @@ machine that owns the worktree.
 
 ## Where the user sees it
 
-Today's total shows beside the WakaTime row in the sidebar, and that row opens a
-page with the per-project and per-category breakdown. A footer button next to
-Settings jumps to the plugin's settings page.
+Today's total shows beside the WakaTime row in the sidebar, and that row opens
+the activity dashboard: working time, agent runtime, turns, parallel agents,
+projects, models, and machines, with a WakaTime card for today's account total
+and heartbeats sent. A footer button next to Settings jumps to the plugin's
+settings page.
+
+The dashboard is measured locally from bb's turn events. Its totals will not
+match WakaTime's, which derives time from the gaps between heartbeats.
 
 The sidebar total comes from `wakatime-cli --today`, cached and refreshed at
 most every 5 minutes and only when new heartbeats went out, so it can lag real
@@ -27,7 +32,16 @@ bb wakatime today     # today's coding time per machine
 bb wakatime sync      # flush heartbeats wakatime-cli queued offline
 bb wakatime doctor    # diagnose a missing CLI or API key; exits 1 on a problem
 bb wakatime log -n 20 # the last heartbeats this plugin sent
+bb wakatime activity week   # the dashboard's local totals (today or week)
+bb wakatime backfill        # rebuild dashboard history from threads not read yet
+bb wakatime backfill-wakatime --from <ISO> --to <ISO> --dry-run  # plan re-sending an outage window
+bb wakatime backfill-wakatime --status
 ```
+
+If WakaTime is missing a stretch of bb time because reporting was down, run
+`backfill-wakatime` with `--dry-run` first, then without it. It stays well
+under WakaTime's rate limit because wakatime-cli queues the heartbeats and
+drains at most 1,000 per 2 minutes.
 
 Start with `bb wakatime doctor` for any "it isn't tracking" question. It prints
 the effective settings and names the problem.

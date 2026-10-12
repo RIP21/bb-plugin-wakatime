@@ -30,6 +30,7 @@
     "lib",
     "hooks",
     "*.test.ts",
-    "*.test.tsx"
+    "*.test.tsx",
+    "activity"
   ]
 }

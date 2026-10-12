@@ -1,6 +1,6 @@
 /**
- * WakaTime UI: a live total in the sidebar, a panel with today's breakdown, and
- * a settings section for connection state.
+ * WakaTime UI: a live total in the sidebar, the activity dashboard with what
+ * was sent to WakaTime today, and a settings section for connection state.
  *
  * On placement: bb's `sidebarFooterAction` next to Settings is host-rendered
  * chrome with deliberately empty props, so it can only be an icon button with a
@@ -14,6 +14,7 @@ import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import type { rpcContract } from "./server";
+import { ActiveThreadIndicator, Caption, Dashboard, Panel, Rows } from "./activity/dashboard";
 
 interface TodayStats {
   total: string | null;
@@ -107,85 +108,60 @@ function StatRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** The panel page: today's total plus where the heartbeats went. */
-function TodayPanel() {
-  const { stats, error, reload } = useTodayStats();
-
-  if (error) return <div className="p-4 text-sm text-destructive">{error}</div>;
-  if (!stats) return <div className="p-4 text-sm text-muted-foreground">Loading…</div>;
-
-  const noneYet = stats.heartbeats.sent === 0 && stats.heartbeats.failed === 0;
+/**
+ * What reached WakaTime today, shown inside the dashboard. The dashboard's
+ * figures are measured locally; this card is the account's own total.
+ */
+export function WakaTimeToday() {
+  const { stats, error } = useTodayStats();
+  const failed = stats?.heartbeats.failed ?? 0;
+  const top = stats?.projects[0];
 
   return (
-    <div className="h-full overflow-y-auto p-4 md:p-5">
-      <div className="mx-auto w-full max-w-3xl space-y-5">
-        <div>
-          <p className="text-3xl tabular-nums">{stats.total ?? "not available yet"}</p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Coding time today, as WakaTime counts it
-            {stats.refreshedAt ? `, read ${formatAge(stats.refreshedAt)}` : ""}
-          </p>
-          {stats.error ? <p className="mt-1 text-sm text-destructive">{stats.error}</p> : null}
-        </div>
-
-        <div className="space-y-1 rounded-lg border border-border p-3">
-          <StatRow label="Threads running" value={String(stats.activeThreads)} />
-          <StatRow label="Heartbeats reported" value={String(stats.heartbeats.sent)} />
-          {stats.heartbeats.failed > 0 ? (
-            <StatRow label="Heartbeats failed" value={String(stats.heartbeats.failed)} />
+    <Panel
+      index={1}
+      title="WakaTime"
+      note="Heartbeats this plugin sent today, and the total WakaTime derives from them"
+      icon="clock"
+      action={stats?.refreshedAt ? <Caption>read {formatAge(stats.refreshedAt)}</Caption> : null}
+    >
+      {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      {!error && !stats ? <p className="text-sm text-muted-foreground">Loading…</p> : null}
+      {stats ? (
+        <>
+          <Rows
+            items={[
+              { label: "Today on WakaTime", value: stats.total ?? "not available yet" },
+              {
+                label: "Heartbeats sent",
+                value: String(stats.heartbeats.sent),
+                hint: failed > 0 ? `${failed} failed` : undefined,
+              },
+              { label: "Threads running", value: String(stats.activeThreads) },
+              {
+                label: "Busiest project",
+                value: top?.project ?? "none yet",
+                hint: top ? `${top.heartbeats} beats` : undefined,
+              },
+            ]}
+          />
+          {stats.error ? <p className="mt-4 text-sm text-destructive">{stats.error}</p> : null}
+          {stats.heartbeats.sent === 0 && failed === 0 ? (
+            <p className="mt-4 text-xs text-muted-foreground">
+              Nothing reported yet today. Time is counted while a thread is running.
+            </p>
           ) : null}
-        </div>
+        </>
+      ) : null}
+    </Panel>
+  );
+}
 
-        {noneYet ? (
-          <p className="text-sm text-muted-foreground">
-            Nothing reported yet today. Time is counted while a thread is running.
-          </p>
-        ) : null}
-
-        {stats.projects.length > 0 ? (
-          <section className="space-y-2">
-            <h2 className="text-sm font-medium">Projects</h2>
-            <div className="space-y-1 rounded-lg border border-border p-3">
-              {stats.projects.map((project) => (
-                <StatRow
-                  key={project.project}
-                  label={project.project}
-                  value={
-                    project.lineChanges > 0
-                      ? `${project.heartbeats} beats, ${project.lineChanges} lines`
-                      : `${project.heartbeats} beats`
-                  }
-                />
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        {stats.categories.length > 0 ? (
-          <section className="space-y-2">
-            <h2 className="text-sm font-medium">Categories</h2>
-            <div className="space-y-1 rounded-lg border border-border p-3">
-              {stats.categories.map((category) => (
-                <StatRow
-                  key={category.category}
-                  label={category.category}
-                  value={`${category.heartbeats} beats`}
-                />
-              ))}
-            </div>
-          </section>
-        ) : null}
-
-        <p className="text-xs text-muted-foreground">
-          Beats are heartbeats this plugin sent, counted locally. The time at the top comes from
-          WakaTime itself, which derives it from the gaps between them.
-        </p>
-
-        <Button size="sm" variant="outline" onClick={() => void reload()}>
-          Refresh
-        </Button>
-      </div>
-    </div>
+function WakaTimePage() {
+  return (
+    <Dashboard>
+      <WakaTimeToday />
+    </Dashboard>
   );
 }
 
@@ -304,7 +280,8 @@ export default definePluginApp((app) => {
     title: "WakaTime",
     icon: "Clock",
     path: "today",
-    component: TodayPanel,
+    component: WakaTimePage,
+    headerContent: ActiveThreadIndicator,
     experimental_sidebarAccessory: TodayAccessory,
   });
 

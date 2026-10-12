@@ -70,7 +70,7 @@ describe("registration", () => {
 
     expect(harness.registrations.services.map((service) => service.name)).toContain("tracker");
     expect(harness.registrations.schedules.map((schedule) => schedule.name).sort()).toEqual(["prune", "sync-offline"]);
-    expect(harness.registrations.rpcMethods.sort()).toEqual(["recentActivity", "status", "syncNow", "todayStats"]);
+    expect(harness.registrations.rpcMethods.sort()).toEqual(["getActivityStatus", "getSummary", "recentActivity", "status", "syncNow", "todayStats"]);
     expect(harness.registrations.cli?.name).toBe("wakatime");
   });
 
@@ -78,7 +78,7 @@ describe("registration", () => {
     const { bb, harness } = fakeHost();
     await plugin(bb);
     const names = harness.registrations.cli?.commands?.map((command) => command.name).sort();
-    expect(names).toEqual(["doctor", "log", "status", "sync", "today"]);
+    expect(names).toEqual(["activity", "backfill", "backfill-wakatime", "doctor", "log", "recheck-history", "status", "sync", "today"]);
     for (const command of harness.registrations.cli?.commands ?? []) {
       expect(command.summary, command.name).toBeTruthy();
       expect(command.usage, command.name).toContain("bb wakatime");
@@ -89,7 +89,7 @@ describe("registration", () => {
     const { bb, harness } = fakeHost();
     await plugin(bb);
     await harness.lifecycle.reload(plugin);
-    expect(harness.registrations.rpcMethods.sort()).toEqual(["recentActivity", "status", "syncNow", "todayStats"]);
+    expect(harness.registrations.rpcMethods.sort()).toEqual(["getActivityStatus", "getSummary", "recentActivity", "status", "syncNow", "todayStats"]);
   });
 });
 
@@ -154,6 +154,25 @@ describe("todayStats rpc", () => {
     expect(harness.experimental_hostRpcCalls.length).toBe(before);
     expect(stats.heartbeats.sent).toBe(0);
     expect(stats.total).toBeNull();
+  });
+
+  it("finds a thread that was already running past the first page of threads", async () => {
+    // bb does not list threads newest first, so a running thread can sit
+    // anywhere; it was active before the plugin loaded, so no event says so.
+    const threads = Array.from({ length: 250 }, (_, index) =>
+      makeThreadResponse({ id: `thr_${index}`, status: index === 240 ? "active" : "idle" }));
+    const { bb, harness } = fakeHost({ settings: { apiKey: "k" } });
+    harness.sdk.stub("threads.list", async ({ limit = 50, offset = 0 }: { limit?: number; offset?: number }) =>
+      threads.slice(offset, offset + limit));
+    await plugin(bb);
+
+    const service = harness.behavior.runService("tracker");
+    const tracking = async () => ((await harness.behavior.callRpc("status", { includeToday: false })) as {
+      tracking: { activeThreads: number };
+    }).tracking.activeThreads;
+    await waitFor(async () => (await tracking()) === 1);
+    service.controller.abort();
+    await service.done;
   });
 
   it("reports the total the poll loop cached, in both forms", async () => {
@@ -315,7 +334,7 @@ describe("cli command", () => {
     await plugin(bb);
     const result = await harness.behavior.runCli(["nope"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("Try status, today, sync, doctor, or log.");
+    expect(result.stderr).toContain("Try status, today, sync, doctor, log, activity, or backfill.");
   });
 });
 
@@ -353,6 +372,26 @@ describe("thread activity", () => {
       .map((call) => call.input as HeartbeatCallInput);
   }
 
+  it("never asks bb for more than 100 events at once", async () => {
+    // bb answers a larger page with HTTP 400 and no rows; that stopped every
+    // heartbeat once bb started enforcing it.
+    const limits: number[] = [];
+    const { bb, harness } = fakeHost({ settings: { apiKey: "k" } });
+    harness.sdk.stub("threads.events.list", async ({ limit, types }: { limit?: string; types?: string[] }) => {
+      limits.push(Number(limit));
+      if (Number(limit) > 100) throw new Error("HTTP 400: Thread event limit cannot exceed 100");
+      return types?.includes("item/completed") ? [fileChange] : [];
+    });
+    await plugin(bb);
+
+    const inputs = await runOnePoll(bb, harness);
+
+    expect(inputs.flatMap((input) => input.groups.flatMap((group) => group.heartbeats))
+      .some((heartbeat) => heartbeat.entity === "/work/app/src/a.ts")).toBe(true);
+    expect(limits.length).toBeGreaterThan(0);
+    expect(Math.max(...limits)).toBeLessThanOrEqual(100);
+  });
+
   it("reports an agent's file change to the host that owns the worktree", async () => {
     const { bb, harness } = fakeHost({ settings: { apiKey: "k" } });
     harness.sdk.stub("threads.events.list", async () => [fileChange]);
@@ -361,7 +400,7 @@ describe("thread activity", () => {
     const inputs = await runOnePoll(bb, harness);
     const heartbeats = inputs.flatMap((input) => input.groups.flatMap((group) => group.heartbeats));
 
-    expect(inputs[0]!.options.pluginUserAgent).toBe("bb/0.39.0 bb-wakatime/0.1.0");
+    expect(inputs[0]!.options.pluginUserAgent).toBe("bb/0.39.0 bb-wakatime/0.2.0");
     const change = heartbeats.find((heartbeat) => heartbeat.entity === "/work/app/src/a.ts");
     // One added and one removed line is two lines of churn.
     expect(change).toMatchObject({ category: "ai coding", is_write: true, ai_line_changes: 2 });
@@ -422,6 +461,73 @@ describe("thread activity", () => {
       entries: { entity: string }[];
     };
     expect(result.entries.every((entry) => !entry.entity.includes("a.ts"))).toBe(true);
+  });
+});
+
+describe("wakatime backfill", () => {
+  const WINDOW_START = Date.UTC(2026, 8, 20, 9);
+  const editAt = (seq: number, at: number) => ({
+    seq,
+    createdAt: at,
+    type: "item/completed",
+    data: {
+      item: {
+        type: "fileChange",
+        status: "completed",
+        approvalStatus: null,
+        changes: [{ path: "/work/app/src/gone.ts", kind: "update", diff: "--- a/x\n+++ b/x\n+one\n" }],
+      },
+    },
+  });
+
+  async function setup() {
+    const host = fakeHost({ settings: { apiKey: "k" } });
+    host.harness.sdk.stub("threads.list", async ({ offset = 0 }: { offset?: number }) =>
+      offset === 0 ? [makeThreadResponse({ id: "thr_old", projectId: "proj_1", environmentId: "env_1", status: "idle" })] : []);
+    host.harness.sdk.stub("threads.events.list", async ({ types, limit }: { types?: string[]; limit?: string }) => {
+      if (Number(limit) > 100) throw new Error("HTTP 400: Thread event limit cannot exceed 100");
+      return types?.includes("item/completed")
+        ? [editAt(1, WINDOW_START - 60_000), editAt(2, WINDOW_START + 60_000), editAt(3, WINDOW_START + 10 * 60_000)]
+        : [];
+    });
+    await plugin(host.bb);
+    const run = (argv: string[]) => host.harness.behavior.runCli(["backfill-wakatime", ...argv]);
+    const waitDone = () => waitFor(async () => /: (done|failed)/.test((await run(["--status"])).stdout), 10_000);
+    return { ...host, run, waitDone };
+  }
+
+  const window = ["--from", new Date(WINDOW_START).toISOString(), "--to", new Date(WINDOW_START + 5 * 60_000).toISOString()];
+  const sends = (harness: ReturnType<typeof fakeHost>["harness"]) =>
+    harness.experimental_hostRpcCalls.filter((call) => call.method === "sendHeartbeats").map((call) => call.input as HeartbeatCallInput);
+
+  it("plans without sending on a dry run", async () => {
+    const { harness, run, waitDone } = await setup();
+    expect((await run([...window, "--dry-run"])).exitCode).toBe(0);
+    await waitDone();
+    const status = (await run(["--status"])).stdout;
+    expect(status).toContain("Dry run");
+    expect(status).toContain("heartbeats: 1 planned");
+    expect(sends(harness)).toHaveLength(0);
+  });
+
+  it("sends only the window, flagged so a removed worktree does not drop it, and refuses a repeat", async () => {
+    const { harness, run, waitDone } = await setup();
+    expect((await run(window)).exitCode).toBe(0);
+    await waitDone();
+    const heartbeats = sends(harness).flatMap((input) => input.groups.flatMap((group) => group.heartbeats));
+    expect(heartbeats).toHaveLength(1);
+    expect(heartbeats[0]).toMatchObject({ entity: "/work/app/src/gone.ts", time: (WINDOW_START + 60_000) / 1000, is_unsaved_entity: true });
+    expect((await run(["--status"])).stdout).toContain("1 handed to wakatime-cli, 0 failed");
+
+    const repeat = await run(window);
+    expect(repeat.exitCode).toBe(1);
+    expect(repeat.stderr).toContain("--force");
+  }, 20_000);
+
+  it("rejects a window that is missing or ends in the future", async () => {
+    const { run } = await setup();
+    expect((await run(["--from", "2026-09-20T00:00:00Z"])).exitCode).toBe(1);
+    expect((await run(["--from", "2026-09-20T00:00:00Z", "--to", "2999-01-01T00:00:00Z"])).exitCode).toBe(1);
   });
 });
 

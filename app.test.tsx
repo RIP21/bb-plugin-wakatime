@@ -36,11 +36,6 @@ async function mountAccessory(today: unknown = TODAY) {
   return renderSlot({ component: accessory }, {}, { rpc: { todayStats: () => today } });
 }
 
-async function mountPanel(today: unknown = TODAY) {
-  const app = await loadPluginApp(() => import("./app"));
-  return renderSlot(app.navPanels[0]!, { subPath: "" }, { rpc: { todayStats: () => today } });
-}
-
 async function mount(status: unknown = STATUS) {
   const app = await loadPluginApp(() => import("./app"));
   const section = app.settingsSections[0]!;
@@ -109,18 +104,23 @@ describe("sidebar accessory", () => {
   });
 });
 
-describe("today panel", () => {
-  it("leads with the total and shows where the time went", async () => {
-    const slot = await mountPanel();
+describe("WakaTime card", () => {
+  async function mountCard(today: unknown = TODAY) {
+    const { WakaTimeToday } = await import("./app");
+    return renderSlot({ component: WakaTimeToday }, {}, { rpc: { todayStats: () => today } });
+  }
+
+  it("leads with WakaTime's total and what was sent", async () => {
+    const slot = await mountCard();
     await slot.findByText("1 hr 2 mins");
+    await slot.findByText("41");
     await slot.findByText("app");
-    await slot.findByText("ai coding");
-    await slot.findByText("39 beats, 128 lines");
+    await slot.findByText("39 beats");
     slot.lifecycle.unmount();
   });
 
-  it("says nothing has been reported rather than showing empty tables", async () => {
-    const slot = await mountPanel({
+  it("says nothing has been reported rather than showing zeros alone", async () => {
+    const slot = await mountCard({
       ...TODAY,
       total: null,
       compact: null,
@@ -129,12 +129,19 @@ describe("today panel", () => {
       projects: [],
     });
     await slot.findByText(/Nothing reported yet today/);
+    await slot.findByText("not available yet");
     slot.lifecycle.unmount();
   });
 
   it("surfaces a failure from WakaTime instead of a blank total", async () => {
-    const slot = await mountPanel({ ...TODAY, total: null, compact: null, error: "unauthorized" });
+    const slot = await mountCard({ ...TODAY, total: null, compact: null, error: "unauthorized" });
     await slot.findByText("unauthorized");
+    slot.lifecycle.unmount();
+  });
+
+  it("counts failed heartbeats next to the sent ones", async () => {
+    const slot = await mountCard({ ...TODAY, heartbeats: { sent: 41, failed: 3 } });
+    await slot.findByText("3 failed");
     slot.lifecycle.unmount();
   });
 });

@@ -49,8 +49,10 @@ bb wakatime doctor
 
 - **A live total in the sidebar.** The WakaTime row shows today's coding time
   (`41m`) beside it, refreshed when it changes.
-- **The WakaTime page.** Click that row for today's total, threads running,
-  heartbeats sent, and a per-project and per-category breakdown.
+- **The WakaTime page.** Click that row for the activity dashboard: working
+  time per day, agent runtime, turns, parallel agents, projects, models,
+  machines, and a year-long activity graph. A WakaTime card on it shows
+  today's total from your account and how many heartbeats went out.
 - **A button in the sidebar footer**, next to Settings, that jumps to the
   plugin's page.
 
@@ -67,7 +69,40 @@ bb wakatime today     # today's coding time per machine
 bb wakatime sync      # flush heartbeats wakatime-cli queued offline
 bb wakatime doctor    # diagnose a missing CLI or API key; exits 1 on a problem
 bb wakatime log -n 20 # the last heartbeats this plugin sent
+bb wakatime activity week   # the dashboard's local totals (today or week)
+bb wakatime backfill        # rebuild dashboard history from threads not read yet
+bb wakatime recheck-history # verify legacy dashboard turns against bb's events
+bb wakatime backfill-wakatime --from <ISO> --to <ISO> [--dry-run]  # re-send a window when reporting was down
+bb wakatime backfill-wakatime --status
 ```
+
+### Re-sending a window after an outage
+
+`backfill-wakatime` rebuilds the heartbeats a window should have produced and
+hands them to `wakatime-cli`. It reads every thread's `item/completed` events
+through the same extraction as live tracking, and adds a keepalive every 2
+minutes inside each turn the dashboard recorded, which is what the live
+tracker does for a running thread. The live throttle then applies across all
+threads. Run `--dry-run` first: it prints the heartbeat count per day and
+sends nothing.
+
+A few things differ from live heartbeats:
+
+- Every file heartbeat is marked `is_unsaved_entity`. `wakatime-cli` drops a
+  heartbeat whose file is missing, and old worktrees are usually gone.
+- An archived thread has lost its environment. Its worktree is read back from
+  its commands' `cwd`, and failing that it gets a stand-in path
+  `/bb/<project>/<thread>` so the time still lands on the right project. Its
+  machine is assumed only when bb has exactly one.
+- A window that overlaps an earlier backfill is refused unless you pass
+  `--force`.
+
+On rate limits: WakaTime allows fewer than 10 requests a second averaged over
+any 5 minutes, and 25 heartbeats per bulk request. `wakatime-cli` posts at
+most 10 heartbeats per request, queues the rest offline, and drains that queue
+at most 1,000 heartbeats (100 requests) per 2 minutes, roughly 0.8 requests a
+second. The backfill also pauses 3 seconds between its own sends. A month of
+history (about 5,000 heartbeats) drained in about 16 minutes with no 429s.
 
 ## Settings
 
@@ -163,11 +198,33 @@ worth knowing if you ever touch that code.
 - **A directory path from an unrecognised tool is assumed to be a file.**
   Known search tools are handled, and a trailing slash is respected.
 
+## The activity dashboard
+
+The dashboard comes from
+[MayankBansal12/bb-plugin-wakatime](https://github.com/MayankBansal12/bb-plugin-wakatime)
+v0.5.3 (MIT), which tracks bb activity locally and sends nothing anywhere. It
+lives in `activity/` and keeps its own tables in the same `data.db`.
+
+Its numbers are measured from bb's turn events, not from WakaTime, so they
+will not match your WakaTime dashboard exactly. A turn counts from its
+`turn/started` to its `turn/completed`, time waiting on an approval is
+excluded, and parallel turns are unioned for working time but summed for agent
+runtime.
+
+On first start the dashboard replays every thread it has not read before, so
+history from before the plugin was installed shows up. Turns replayed this way
+carry their thread's project and machine; their model stays `unknown` because
+bb's events do not record it.
+
+`lib/storage.ts` holds the one migration list. The dashboard's statements come
+first because an existing Mayank install already recorded them; changing or
+reordering any shipped statement makes bb refuse to load the plugin.
+
 ## Development
 
 ```sh
 npm install
-npm test          # 242 tests
+npm test          # 323 tests
 npm run typecheck
 bb plugin dev     # rebuild and reload on save
 ```
@@ -180,6 +237,9 @@ The interesting logic is dependency-injected and tested without a bb server:
 - `lib/cli-install.ts` — finding and verifying the binary
 - `lib/tracker.ts` — cursors, keepalives, grouping per machine
 - `lib/duration.ts` — squeezing `--today` text into the sidebar's narrow box
+- `lib/events.ts` — thread event reads split into bb's 100-event pages
+- `activity/collector.ts`, `activity/analytics.ts` — the dashboard's turn
+  intervals and the totals derived from them
 
 `server.test.ts` and `host.test.ts` drive the real entry points through the
 SDK's own harnesses.

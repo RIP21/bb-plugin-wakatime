@@ -447,7 +447,7 @@ export function placeCursor(recent: readonly ThreadEventRowLike[], firstSeenAt: 
   return Math.max(Math.min(...own.map((row) => row.seq)) - 1, 0);
 }
 
-function groupByHost(entries: readonly PendingHeartbeat[]): Map<string, PendingHeartbeat[]> {
+export function groupByHost(entries: readonly PendingHeartbeat[]): Map<string, PendingHeartbeat[]> {
   const byHost = new Map<string, PendingHeartbeat[]>();
   for (const entry of entries) {
     const bucket = byHost.get(entry.hostId);
